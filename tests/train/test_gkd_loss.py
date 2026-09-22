@@ -8,6 +8,45 @@ from swift.rlhf_trainers.gkd_loss import TeacherOutput, gkd_loss
 
 class TestGKDLoss(unittest.TestCase):
 
+    def test_mixed_precision_loss_and_gradients_match_fp64(self):
+        generator = torch.Generator().manual_seed(0)
+        student_logits = (torch.randn(1, 4, 64, generator=generator) * 2).bfloat16().float()
+        teacher_logits = (student_logits + torch.randn(1, 4, 64, generator=generator) * 0.03).bfloat16()
+        labels = torch.tensor([[1, -100, 2, 3]])
+        temperature = 0.9
+        for mode in ('full', 'topk'):
+            for beta in (0., 0.5, 1.):
+                with self.subTest(mode=mode, beta=beta):
+                    student = student_logits.clone().requires_grad_()
+                    # Compare the same quantized inputs, not independently generated FP64 values.
+                    reference = student.detach().double().requires_grad_()
+                    teacher = TeacherOutput(full_logits=teacher_logits)
+                    if mode == 'topk':
+                        teacher = teacher.to_topk(16)
+                        reference_logits = reference.gather(-1, teacher.topk_indices)
+                        reference_teacher = teacher.topk_logprobs.double()
+                    else:
+                        reference_logits = reference
+                        reference_teacher = teacher_logits.double()
+                    total, count = gkd_loss(student, teacher, labels, beta, temperature, chunk_size=2)
+                    self.assertEqual(count.item(), 3)
+                    loss = total / count
+                    s_log = (reference_logits[labels != -100] / temperature).log_softmax(-1)
+                    t_log = (reference_teacher[labels != -100] / temperature).log_softmax(-1)
+                    if beta == 0.:
+                        expected = (t_log.exp() * (t_log - s_log)).sum() / 3
+                    elif beta == 1.:
+                        expected = (s_log.exp() * (s_log - t_log)).sum() / 3
+                    else:
+                        mixture_log = ((1 - beta) * s_log.exp() + beta * t_log.exp()).log()
+                        expected = ((1 - beta) * s_log.exp() * (s_log - mixture_log) + beta * t_log.exp() *
+                                    (t_log - mixture_log)).sum() / 3
+                    actual_grad, = torch.autograd.grad(loss, student)
+                    expected_grad, = torch.autograd.grad(expected, reference)
+                    torch.testing.assert_close(loss.double(), expected, rtol=1e-3, atol=1e-7)
+                    torch.testing.assert_close(actual_grad.double(), expected_grad, rtol=1e-3, atol=1e-8)
+                    torch.testing.assert_close(actual_grad[:, 1], torch.zeros_like(actual_grad[:, 1]))
+
     def test_empty_loss_dtype_and_vocab_alignment(self):
         for dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
             for teacher_vocab in (5, 8, 11):
